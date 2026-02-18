@@ -1,20 +1,20 @@
 #include <M5Atom.h>
-#include <M5UnitRFID.h>
+#include <Wire.h>
+#include <MFRC522_I2C.h> // Nowa biblioteka
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
-#include "secrets.h" // Tu są Twoje hasła
+#include "secrets.h"
 
 // --- KONFIGURACJA MAPOWANIA ---
 struct ProjectMapping {
-    String uid;             // UID Taga (np. "04a1b2c3")
-    unsigned long projectId;// ID Projektu w Toggl (np. 123456)
-    String name;            // Nazwa dla logów (np. "DEV")
+    String uid;
+    unsigned long projectId;
+    String name;
 };
 
-// TU BĘDZIEMY WPISYWAĆ TWOJE TAGI
-// Na razie zostaw puste lub wpisz losowe, uzupełnisz po skanowaniu
+// TU WPISZ SWOJE TAGI
 ProjectMapping knownTags[] = {
     {"", 000000, "DEV"},   
     {"", 000000, "CALL"},
@@ -23,9 +23,10 @@ ProjectMapping knownTags[] = {
 const int tagsCount = sizeof(knownTags) / sizeof(knownTags[0]);
 
 // --- OBIEKTY ---
-M5UnitRFID rfid;
+// Adres I2C dla M5Stack Unit RFID to zazwyczaj 0x28
+MFRC522_I2C rfid(0x28, -1); 
 
-// --- POMOCNICZE: Czas NTP (ISO 8601) ---
+// --- POMOCNICZE: Czas NTP ---
 String getISOTime() {
     struct tm timeinfo;
     if(!getLocalTime(&timeinfo)) return "";
@@ -37,21 +38,20 @@ String getISOTime() {
 // --- KOMUNIKACJA Z TOGGLEM ---
 void sendTogglRequest(unsigned long projectId, String description) {
     if(WiFi.status() != WL_CONNECTED) {
-        M5.dis.drawpix(0, 0xFF0000); // Czerwony - brak sieci
+        M5.dis.drawpix(0, 0xFF0000); // Czerwony
         return;
     }
 
     HTTPClient http;
     WiFiClientSecure client;
-    client.setInsecure(); // Pomijamy certyfikaty SSL (wystarczy dla DIY)
+    client.setInsecure(); 
 
     String url = "https://api.track.toggl.com/api/v9/time_entries";
     
     Serial.printf(">> Startuje timer: %s...\n", description.c_str());
-    M5.dis.drawpix(0, 0x0000FF); // Niebieski - Przetwarzanie
+    M5.dis.drawpix(0, 0x0000FF); // Niebieski
 
     if (http.begin(client, url)) {
-        // Auth: Token jako user, hasło "api_token"
         http.setAuthorization(TOGGL_TOKEN, "api_token");
         http.addHeader("Content-Type", "application/json");
 
@@ -73,31 +73,33 @@ void sendTogglRequest(unsigned long projectId, String description) {
 
         if (httpCode == 200) {
             Serial.printf(">> SUKCES! (Kod 200)\n");
-            M5.dis.drawpix(0, 0xFFFFFF); // BIAŁY - Sukces
+            M5.dis.drawpix(0, 0xFFFFFF); // BIAŁY
             delay(1000);
-            M5.dis.drawpix(0, 0x00FF00); // Powrót do zielonego
+            M5.dis.drawpix(0, 0x00FF00); 
         } else {
             Serial.printf(">> BLAD HTTP: %d\n", httpCode);
             Serial.println(http.getString());
-            M5.dis.drawpix(0, 0xFF0000); // CZERWONY - Błąd API
+            M5.dis.drawpix(0, 0xFF0000); 
             delay(2000);
             M5.dis.drawpix(0, 0x00FF00);
         }
         http.end();
-    } else {
-        Serial.println(">> Blad polaczenia z URL");
     }
 }
 
 void setup() {
-    M5.begin(true, false, true); // Init Atom
+    M5.begin(true, false, true);
     Serial.begin(115200);
-    rfid.begin();
+    
+    // Inicjalizacja I2C dla Atom Lite (Grove Port)
+    // SDA = 26, SCL = 32
+    Wire.begin(26, 32); 
+    rfid.begin(); // Init RFID
 
-    // 1. WiFi
+    // WiFi
     Serial.print("Laczenie z WiFi: ");
     Serial.println(WIFI_SSID);
-    M5.dis.drawpix(0, 0x000055); // Ciemny niebieski
+    M5.dis.drawpix(0, 0x000055); 
     
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     while (WiFi.status() != WL_CONNECTED) {
@@ -106,7 +108,7 @@ void setup() {
     }
     Serial.println("\nPolaczono!");
 
-    // 2. Czas NTP (Kluczowe dla Toggla!)
+    // Czas NTP
     configTime(0, 0, "pool.ntp.org", "time.nist.gov"); 
     Serial.print("Synchronizacja czasu");
     struct tm timeinfo;
@@ -120,10 +122,10 @@ void setup() {
 }
 
 void loop() {
-    M5.update(); // Obsługa przycisku (jeśli kiedyś użyjesz)
+    M5.update();
 
+    // Sprawdzenie czy jest nowa karta
     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-        // Konwersja UID na String
         String uid = "";
         for (byte i = 0; i < rfid.uid.size; i++) {
             if(rfid.uid.uidByte[i] < 0x10) uid += "0";
@@ -133,7 +135,6 @@ void loop() {
         Serial.print(">>> Wykryto TAG UID: ");
         Serial.println(uid);
 
-        // Szukanie w bazie
         bool found = false;
         for(int i=0; i<tagsCount; i++) {
             if(knownTags[i].uid == uid) {
@@ -144,15 +145,17 @@ void loop() {
         }
 
         if(!found) {
-            Serial.println(">>> Nieznany tag. Skopiuj UID i dodaj do kodu!");
-            M5.dis.drawpix(0, 0xFF00FF); // FIOLETOWY - Nieznany tag
+            Serial.println(">>> Nieznany tag!");
+            M5.dis.drawpix(0, 0xFF00FF); // Fiolet
             delay(500);
             M5.dis.drawpix(0, 0x00FF00);
         }
 
-        // Blokada przed wielokrotnym odczytem
-        delay(1000); 
+        // Halt i StopCrypto
         rfid.PICC_HaltA();
         rfid.PCD_StopCrypto1();
+        
+        // Czekaj chwilę, żeby nie spamować requestami
+        delay(2000); 
     }
 }
