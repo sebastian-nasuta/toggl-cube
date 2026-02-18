@@ -1,21 +1,35 @@
 #pragma once
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <time.h>
 #include "secrets.h"
 
 class NetworkManager {
+private:
+    static WiFiMulti wifiMulti;
+
 public:
     static void connect() {
         if (WiFi.status() == WL_CONNECTED) return;
 
-        WiFi.begin(WIFI_SSID, WIFI_PASS);
-        while (WiFi.status() != WL_CONNECTED) {
-            delay(500); 
+        // Dodaj wszystkie zdefiniowane sieci
+        for (int i = 0; i < WIFI_NETWORKS_COUNT; i++) {
+            wifiMulti.addAP(WIFI_NETWORKS[i].ssid, WIFI_NETWORKS[i].pass);
         }
+
+        Serial.println(">> [WiFi] Connecting...");
+        
+        // Próba połączenia z którąkolwiek siecią
+        while (wifiMulti.run() != WL_CONNECTED) {
+            delay(500);
+            Serial.print(".");
+        }
+        Serial.println("\n>> [WiFi] Connected to: " + WiFi.SSID());
     }
 
     static bool isConnected() {
-        return WiFi.status() == WL_CONNECTED;
+        // wifiMulti.run() zarządza ponownym łączeniem w tle jeśli zerwie
+        return wifiMulti.run() == WL_CONNECTED;
     }
 
     static void syncTime() {
