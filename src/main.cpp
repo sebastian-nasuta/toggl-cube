@@ -16,17 +16,19 @@ struct ProjectMapping {
 
 // TU WPISZ SWOJE TAGI
 ProjectMapping knownTags[] = {
-    {"", 000000, "DEV"},   
-    {"", 000000, "CALL"},
-    {"", 000000, "PRIV"} 
+    {"04db363dc12a81", 216923300, "BREAK"},   
+    {"04e5363dc12a81", 216923282, "CALL"},
+    {"04e4363dc12a81", 216923280, "DEV"},
+    {"04e3363dc12a81", 216923294, "INTERNAL"},
+    {"04e2363dc12a81", 216923286, "PRIV"},
+    {"04dc363dc12a81", 0, "STOP"}
 };
 const int tagsCount = sizeof(knownTags) / sizeof(knownTags[0]);
 
 // --- OBIEKTY ---
-// Adres I2C dla M5Stack Unit RFID to zazwyczaj 0x28
 MFRC522_I2C rfid(0x28, -1); 
 
-// --- POMOCNICZE: Czas NTP ---
+// --- POMOCNICZE ---
 String getISOTime() {
     struct tm timeinfo;
     if(!getLocalTime(&timeinfo)) return "";
@@ -35,12 +37,70 @@ String getISOTime() {
     return String(timeStringBuff);
 }
 
-// --- KOMUNIKACJA Z TOGGLEM ---
-void sendTogglRequest(unsigned long projectId, String description) {
-    if(WiFi.status() != WL_CONNECTED) {
-        M5.dis.drawpix(0, 0xFF0000); // Czerwony
-        return;
+// --- LOGIKA ZATRZYMYWANIA (NOWA) ---
+void stopRunningTimer() {
+    if(WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    Serial.println(">> Sprawdzam biegnący timer...");
+    M5.dis.drawpix(0, 0xFFA500); // POMARAŃCZOWY (Szukanie)
+
+    // KROK 1: Pobierz ID aktualnego timera
+    String currentUrl = "https://api.track.toggl.com/api/v9/me/time_entries/current";
+    if (http.begin(client, currentUrl)) {
+        http.setAuthorization(TOGGL_TOKEN, "api_token");
+        int httpCode = http.GET();
+
+        if (httpCode == 200) {
+            String payload = http.getString();
+            StaticJsonDocument<1024> doc;
+            deserializeJson(doc, payload);
+
+            // Sprawdź czy cokolwiek biegnie (API zwraca null jeśli nic nie ma)
+            if (doc.isNull() || doc["id"].isNull()) {
+                Serial.println(">> Nic nie biegnie. Nie ma co zatrzymywać.");
+                M5.dis.drawpix(0, 0x00FF00); // Zielony
+                http.end();
+                return;
+            }
+
+            long entryId = doc["id"];
+            long workspaceId = doc["workspace_id"];
+            Serial.printf(">> Zatrzymuje timer ID: %ld\n", entryId);
+
+            http.end(); // Zamykamy GET, otwieramy PATCH
+
+            // KROK 2: Zatrzymaj timer (PATCH)
+            String stopUrl = "https://api.track.toggl.com/api/v9/workspaces/" + String(workspaceId) + "/time_entries/" + String(entryId) + "/stop";
+            
+            if(http.begin(client, stopUrl)) {
+                http.setAuthorization(TOGGL_TOKEN, "api_token");
+                http.addHeader("Content-Type", "application/json"); // Wymagane
+                
+                // Toggl wymaga PATCH. Biblioteka HTTPClient obsługuje to przez sendRequest
+                int patchCode = http.sendRequest("PATCH", ""); 
+
+                if (patchCode == 200) {
+                    Serial.println(">> ZATRZYMANO!");
+                    M5.dis.drawpix(0, 0xFF0000); // CZERWONY (Stop)
+                    delay(2000);
+                    M5.dis.drawpix(0, 0x00FF00); // Zielony
+                } else {
+                    Serial.printf(">> Blad zatrzymywania: %d\n", patchCode);
+                    M5.dis.drawpix(0, 0xFF00FF); // Błąd
+                }
+            }
+        }
+        http.end();
     }
+}
+
+// --- LOGIKA STARTOWANIA (STARA) ---
+void startTimer(unsigned long projectId, String description) {
+    if(WiFi.status() != WL_CONNECTED) return;
 
     HTTPClient http;
     WiFiClientSecure client;
@@ -48,7 +108,7 @@ void sendTogglRequest(unsigned long projectId, String description) {
 
     String url = "https://api.track.toggl.com/api/v9/time_entries";
     
-    Serial.printf(">> Startuje timer: %s...\n", description.c_str());
+    Serial.printf(">> Startuje: %s...\n", description.c_str());
     M5.dis.drawpix(0, 0x0000FF); // Niebieski
 
     if (http.begin(client, url)) {
@@ -72,16 +132,12 @@ void sendTogglRequest(unsigned long projectId, String description) {
         int httpCode = http.POST(requestBody);
 
         if (httpCode == 200) {
-            Serial.printf(">> SUKCES! (Kod 200)\n");
+            Serial.println(">> START OK!");
             M5.dis.drawpix(0, 0xFFFFFF); // BIAŁY
             delay(1000);
             M5.dis.drawpix(0, 0x00FF00); 
         } else {
-            Serial.printf(">> BLAD HTTP: %d\n", httpCode);
-            Serial.println(http.getString());
             M5.dis.drawpix(0, 0xFF0000); 
-            delay(2000);
-            M5.dis.drawpix(0, 0x00FF00);
         }
         http.end();
     }
@@ -90,46 +146,31 @@ void sendTogglRequest(unsigned long projectId, String description) {
 void setup() {
     M5.begin(true, false, true);
     Serial.begin(115200);
-    
-    // 1. Najpierw inicjalizujemy magistralę I2C (piny Grove w Atom Lite: 26 i 32)
     Wire.begin(26, 32); 
-    
-    // 2. Teraz inicjalizujemy czip RFID
-    rfid.PCD_Init(); 
+    rfid.PCD_Init(); // Init RFID
 
-    // Opcjonalnie: Wypisz wersję firmware'u czytnika na Serial (dobry test czy działa)
-    Serial.print("RFID Reader Info: ");
-    rfid.PCD_DumpVersionToSerial();
-
-    // 3. WiFi
-    Serial.print("Laczenie z WiFi: ");
-    Serial.println(WIFI_SSID);
-    M5.dis.drawpix(0, 0x000055); 
-    
+    // WiFi
     WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.print("WiFi");
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
+        M5.dis.drawpix(0, 0x000055); 
     }
-    Serial.println("\nPolaczono!");
+    Serial.println(" OK!");
 
-    // 4. Czas NTP
+    // Czas
     configTime(0, 0, "pool.ntp.org", "time.nist.gov"); 
-    Serial.print("Synchronizacja czasu");
     struct tm timeinfo;
-    while(!getLocalTime(&timeinfo)){
-        Serial.print(".");
-        delay(500);
-    }
-    Serial.println("\nCzas OK!");
+    while(!getLocalTime(&timeinfo)) delay(500);
+    Serial.println("Czas OK!");
     
-    M5.dis.drawpix(0, 0x00FF00); // ZIELONY = GOTOWY
+    M5.dis.drawpix(0, 0x00FF00); // GOTOWY
 }
 
 void loop() {
     M5.update();
 
-    // Sprawdzenie czy jest nowa karta
     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
         String uid = "";
         for (byte i = 0; i < rfid.uid.size; i++) {
@@ -137,30 +178,30 @@ void loop() {
             uid += String(rfid.uid.uidByte[i], HEX);
         }
         
-        Serial.print(">>> Wykryto TAG UID: ");
-        Serial.println(uid);
+        Serial.print("TAG: "); Serial.println(uid);
 
         bool found = false;
         for(int i=0; i<tagsCount; i++) {
             if(knownTags[i].uid == uid) {
-                sendTogglRequest(knownTags[i].projectId, knownTags[i].name);
+                // TU JEST LOGIKA DECYZYJNA
+                if (knownTags[i].projectId == 0) {
+                    stopRunningTimer();
+                } else {
+                    startTimer(knownTags[i].projectId, knownTags[i].name);
+                }
                 found = true;
                 break;
             }
         }
 
         if(!found) {
-            Serial.println(">>> Nieznany tag!");
-            M5.dis.drawpix(0, 0xFF00FF); // Fiolet
+            M5.dis.drawpix(0, 0xFF00FF); // Nieznany
             delay(500);
             M5.dis.drawpix(0, 0x00FF00);
         }
 
-        // Halt i StopCrypto
         rfid.PICC_HaltA();
         rfid.PCD_StopCrypto1();
-        
-        // Czekaj chwilę, żeby nie spamować requestami
         delay(2000); 
     }
 }
