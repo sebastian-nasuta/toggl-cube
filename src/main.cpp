@@ -1,21 +1,17 @@
 #include <M5Atom.h>
 #include <Wire.h>
-#include <MFRC522_I2C.h> // Nowa biblioteka
+#include <MFRC522_I2C.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
-#include "secrets.h"
+#include "secrets.h" // Plik z hasłami (WiFi, Token, WorkspaceID)
 
-// --- KONFIGURACJA MAPOWANIA ---
-struct ProjectMapping {
-    String uid;               // UID z tagu RFID
-    unsigned long projectId;  // ID projektu w Toggl Track (0 dla STOP)
-    String name;              // Nazwa projektu (do wyświetlania) - opcjonalna, ale przydatna
-    uint32_t color;           // Kolor do wyświetlania na M5Atom (HEX, np. 0xFF0000 dla czerwonego)
-};
+// --- KONFIGURACJA ---
+#define SYNC_INTERVAL 30000  // Co ile ms sprawdzać stan w chmurze (30 sek)
+#define BLINK_INTERVAL 500   // Szybkość mrugania przy nieznanym projekcie
 
-// --- DEFINICJE KOLORÓW (HEX) ---
+// --- KOLORY DIODY ---
 #define COL_RED    0xFF0000
 #define COL_GREEN  0x00FF00
 #define COL_BLUE   0x0000FF
@@ -24,8 +20,17 @@ struct ProjectMapping {
 #define COL_CYAN   0x00FFFF
 #define COL_WHITE  0xFFFFFF
 #define COL_OFF    0x000000
+#define COL_STANDBY 0x001100 // Bardzo ciemny zielony (Czuwanie)
 
-// TU WPISZ SWOJE TAGI
+// --- STRUKTURA PROJEKTU ---
+struct ProjectMapping {
+    String uid;             // UID Taga z RFID
+    unsigned long projectId;// ID Projektu w Toggl (0 = TAG STOPU)
+    String name;            // Nazwa do logów
+    uint32_t color;         // Kolor diody dla tego projektu
+};
+
+// !!! TUTAJ SKONFIGURUJ SWOJE TAGI !!!
 ProjectMapping knownTags[] = {
     {"04db363dc12a81", 216923300, "BREAK", COL_RED},   
     {"04e5363dc12a81", 216923282, "CALL", COL_BLUE},
@@ -39,6 +44,12 @@ const int tagsCount = sizeof(knownTags) / sizeof(knownTags[0]);
 // --- OBIEKTY ---
 MFRC522_I2C rfid(0x28, -1); 
 
+// --- ZMIENNE STANU ---
+unsigned long lastSyncTime = 0;
+unsigned long lastBlinkTime = 0;
+bool isUnknownProject = false;
+bool blinkState = false;
+
 // --- POMOCNICZE ---
 String getISOTime() {
     struct tm timeinfo;
@@ -48,12 +59,14 @@ String getISOTime() {
     return String(timeStringBuff);
 }
 
-// Funkcja ustawiająca kolor diody
-void setStatusLed(uint32_t color) {
+void setLed(uint32_t color) {
     M5.dis.drawpix(0, color);
 }
 
-// --- LOGIKA ZATRZYMYWANIA ---
+// ==========================================
+// LOGIKA API TOGGL
+// ==========================================
+
 void stopRunningTimer(uint32_t successColor) {
     if(WiFi.status() != WL_CONNECTED) return;
 
@@ -61,15 +74,14 @@ void stopRunningTimer(uint32_t successColor) {
     WiFiClientSecure clientGet;
     clientGet.setInsecure();
 
-    // Miganie na biało podczas przetwarzania
-    M5.dis.drawpix(0, COL_WHITE); 
+    Serial.println(">> [STOP] Sprawdzam co biegnie...");
+    setLed(COL_WHITE); 
 
-    // KROK 1: GET
     String currentUrl = "https://api.track.toggl.com/api/v9/me/time_entries/current";
     String entryId = "";
     String workspaceId = "";
-    
-    Serial.println(">> [1/2] Pobieram ID...");
+
+    // KROK A: Pobierz ID
     if (httpGet.begin(clientGet, currentUrl)) {
         httpGet.setAuthorization(TOGGL_TOKEN, "api_token");
         int httpCode = httpGet.GET();
@@ -77,8 +89,9 @@ void stopRunningTimer(uint32_t successColor) {
         if (httpCode == 200) {
             String payload = httpGet.getString();
             if (payload == "null" || payload.length() < 5) {
-                Serial.println(">> Nic nie biegnie.");
-                setStatusLed(successColor); // Ustawiamy kolor STOPU mimo że nic nie biegło
+                // Nic nie biegnie -> wygaś diodę
+                isUnknownProject = false;
+                setLed(COL_OFF); 
                 httpGet.end();
                 return;
             }
@@ -87,38 +100,43 @@ void stopRunningTimer(uint32_t successColor) {
             deserializeJson(doc, payload);
             entryId = doc["id"].as<String>();
             workspaceId = doc["workspace_id"].as<String>();
-        } 
-        httpGet.end(); 
+        }
+        httpGet.end();
     }
 
     if (entryId == "") return;
 
-    // KROK 2: PATCH
+    // KROK B: Zatrzymaj (PATCH)
     HTTPClient httpPatch;
     WiFiClientSecure clientPatch;
     clientPatch.setInsecure();
+    
     String stopUrl = "https://api.track.toggl.com/api/v9/workspaces/" + workspaceId + "/time_entries/" + entryId + "/stop";
-    
-    Serial.println(">> [2/2] Zatrzymuje...");
-    
+    Serial.println(">> [STOP] Wysylam zadanie zatrzymania...");
+
     if(httpPatch.begin(clientPatch, stopUrl)) {
         httpPatch.setAuthorization(TOGGL_TOKEN, "api_token");
         httpPatch.addHeader("Content-Type", "application/json");
+        
         int patchCode = httpPatch.sendRequest("PATCH", "{}"); 
 
         if (patchCode == 200) {
-            Serial.println(">> ZATRZYMANO.");
-            // TU JEST ZMIANA: Ustawiamy kolor przypisany do taga STOP
-            setStatusLed(successColor); 
+            Serial.println(">> [STOP] Zatrzymano.");
+            isUnknownProject = false;
+            
+            // Sygnalizacja sukcesu (Kolor STOPU przez 2 sekundy)
+            setLed(successColor); 
+            delay(2000);
+            
+            // Finalnie: WYGASZENIE
+            setLed(COL_OFF);
         } else {
-            // W razie błędu mrugnij na czerwono i wróć
-            M5.dis.drawpix(0, COL_OFF); delay(200); M5.dis.drawpix(0, COL_RED);
+            setLed(COL_YELLOW); // Błąd
         }
         httpPatch.end();
     }
 }
 
-// --- LOGIKA STARTOWANIA ---
 void startTimer(unsigned long projectId, String description, uint32_t successColor) {
     if(WiFi.status() != WL_CONNECTED) return;
 
@@ -126,12 +144,10 @@ void startTimer(unsigned long projectId, String description, uint32_t successCol
     WiFiClientSecure client;
     client.setInsecure(); 
 
-    // Miganie na biało podczas przetwarzania
-    M5.dis.drawpix(0, COL_WHITE);
+    Serial.printf(">> [START] Uruchamiam: %s...\n", description.c_str());
+    setLed(COL_WHITE); 
 
     String url = "https://api.track.toggl.com/api/v9/time_entries";
-    Serial.printf(">> Startuje: %s...\n", description.c_str());
-
     if (http.begin(client, url)) {
         http.setAuthorization(TOGGL_TOKEN, "api_token");
         http.addHeader("Content-Type", "application/json");
@@ -153,15 +169,71 @@ void startTimer(unsigned long projectId, String description, uint32_t successCol
         int httpCode = http.POST(requestBody);
 
         if (httpCode == 200) {
-            Serial.println(">> START OK!");
-            // TU JEST ZMIANA: Ustawiamy kolor przypisany do taga PROJEKTU
-            setStatusLed(successColor);
+            Serial.println(">> [START] Sukces!");
+            isUnknownProject = false;
+            setLed(successColor); 
         } else {
-            M5.dis.drawpix(0, COL_OFF); delay(200); M5.dis.drawpix(0, COL_RED); // Błąd = Mrugnięcie
+            setLed(COL_YELLOW); // Błąd
         }
         http.end();
     }
 }
+
+void syncWithToggl() {
+    if(WiFi.status() != WL_CONNECTED) return;
+
+    Serial.println(">> [SYNC] Aktualizacja stanu...");
+    
+    HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    String url = "https://api.track.toggl.com/api/v9/me/time_entries/current";
+    
+    if (http.begin(client, url)) {
+        http.setAuthorization(TOGGL_TOKEN, "api_token");
+        int httpCode = http.GET();
+
+        if (httpCode == 200) {
+            String payload = http.getString();
+            
+            // A. Nic nie biegnie
+            if (payload == "null" || payload.length() < 5) {
+                isUnknownProject = false;
+                setLed(COL_OFF); // !!! ZMIANA: PEŁNE WYGASZENIE !!!
+                http.end();
+                return;
+            }
+
+            // B. Coś biegnie
+            StaticJsonDocument<2048> doc;
+            DeserializationError error = deserializeJson(doc, payload);
+            
+            if (!error) {
+                unsigned long currentPid = doc["project_id"].as<unsigned long>();
+                
+                bool matchFound = false;
+                for(int i=0; i<tagsCount; i++) {
+                    if (knownTags[i].projectId == currentPid && currentPid != 0) {
+                        setLed(knownTags[i].color);
+                        isUnknownProject = false;
+                        matchFound = true;
+                        break;
+                    }
+                }
+
+                if (!matchFound) {
+                    isUnknownProject = true; // Będzie mrugać w loop()
+                }
+            }
+        }
+        http.end();
+    }
+}
+
+// ==========================================
+// SETUP & LOOP
+// ==========================================
 
 void setup() {
     M5.begin(true, false, true);
@@ -169,43 +241,51 @@ void setup() {
     Wire.begin(26, 32); 
     rfid.PCD_Init();
 
-    // WiFi
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.print("WiFi");
-    M5.dis.drawpix(0, COL_WHITE); // Świeci na biało podczas bootowania
+    setLed(COL_WHITE);
     while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-        M5.dis.drawpix(0, COL_OFF); delay(100); M5.dis.drawpix(0, COL_WHITE);
+        delay(500); 
+        setLed(COL_OFF); delay(100); setLed(COL_WHITE);
     }
-    Serial.println(" OK!");
-
+    
     configTime(0, 0, "pool.ntp.org", "time.nist.gov"); 
     struct tm timeinfo;
     while(!getLocalTime(&timeinfo)) delay(500);
-    Serial.println("Czas OK!");
     
-    // Po starcie gasimy diodę (czeka na pierwszą akcję)
-    // Lub ustawiamy np. na Zielony (Gotowy)
-    M5.dis.drawpix(0, 0x001100); // Bardzo ciemny zielony (Dim Green)
+    syncWithToggl();
 }
 
 void loop() {
     M5.update();
+    unsigned long currentMillis = millis();
 
+    // 1. MRUGANIE (tylko nieznane projekty)
+    if (isUnknownProject) {
+        if (currentMillis - lastBlinkTime >= BLINK_INTERVAL) {
+            lastBlinkTime = currentMillis;
+            blinkState = !blinkState;
+            setLed(blinkState ? COL_RED : COL_OFF);
+        }
+    }
+
+    // 2. SYNCHRONIZACJA
+    if (currentMillis - lastSyncTime >= SYNC_INTERVAL) {
+        lastSyncTime = currentMillis;
+        syncWithToggl();
+    }
+
+    // 3. RFID
     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
         String uid = "";
         for (byte i = 0; i < rfid.uid.size; i++) {
             if(rfid.uid.uidByte[i] < 0x10) uid += "0";
             uid += String(rfid.uid.uidByte[i], HEX);
         }
-        
-        Serial.print("TAG: "); Serial.println(uid);
+        Serial.println(">>> SCAN TAG: " + uid);
 
         bool found = false;
         for(int i=0; i<tagsCount; i++) {
             if(knownTags[i].uid == uid) {
-                // Przekazujemy kolor z konfiguracji do funkcji
                 if (knownTags[i].projectId == 0) {
                     stopRunningTimer(knownTags[i].color);
                 } else {
@@ -217,16 +297,16 @@ void loop() {
         }
 
         if(!found) {
-            // Nieznany tag - szybkie mrugnięcie na żółto
-            M5.dis.drawpix(0, COL_YELLOW); 
+            setLed(COL_YELLOW); delay(200); setLed(COL_OFF); delay(200); setLed(COL_YELLOW);
             delay(500);
-            M5.dis.drawpix(0, COL_OFF); // Gasimy
+            setLed(COL_OFF); // Po błędzie gasimy
+            lastSyncTime = 0; // Wymuś sync
+        } else {
+            lastSyncTime = millis();
         }
 
         rfid.PICC_HaltA();
         rfid.PCD_StopCrypto1();
-        
-        // Ważne: opóźnienie, żeby nie czytał w kółko
-        delay(2000); 
+        delay(1500); 
     }
 }
