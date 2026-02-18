@@ -41,60 +41,93 @@ String getISOTime() {
 void stopRunningTimer() {
     if(WiFi.status() != WL_CONNECTED) return;
 
-    HTTPClient http;
-    WiFiClientSecure client;
-    client.setInsecure();
+    HTTPClient httpGet;
+    WiFiClientSecure clientGet;
+    clientGet.setInsecure();
 
-    Serial.println(">> Sprawdzam biegnący timer...");
-    M5.dis.drawpix(0, 0xFFA500); // POMARAŃCZOWY (Szukanie)
+    // ZMIANA: Traktujemy ID jako tekst, żeby nie przepełnić licznika
+    String entryId = "";
+    String workspaceId = "";
 
-    // KROK 1: Pobierz ID aktualnego timera
+    Serial.println(">> [1/2] Pobieram biegnący timer...");
+    M5.dis.drawpix(0, 0xFFA500); // POMARAŃCZOWY
+
     String currentUrl = "https://api.track.toggl.com/api/v9/me/time_entries/current";
-    if (http.begin(client, currentUrl)) {
-        http.setAuthorization(TOGGL_TOKEN, "api_token");
-        int httpCode = http.GET();
+    
+    if (httpGet.begin(clientGet, currentUrl)) {
+        httpGet.setAuthorization(TOGGL_TOKEN, "api_token");
+        int httpCode = httpGet.GET();
 
         if (httpCode == 200) {
-            String payload = http.getString();
-            StaticJsonDocument<1024> doc;
-            deserializeJson(doc, payload);
-
-            // Sprawdź czy cokolwiek biegnie (API zwraca null jeśli nic nie ma)
-            if (doc.isNull() || doc["id"].isNull()) {
-                Serial.println(">> Nic nie biegnie. Nie ma co zatrzymywać.");
-                M5.dis.drawpix(0, 0x00FF00); // Zielony
-                http.end();
+            String payload = httpGet.getString();
+            
+            if (payload == "null" || payload.length() < 5) {
+                Serial.println(">> Nic nie biegnie.");
+                M5.dis.drawpix(0, 0x00FF00); 
+                httpGet.end();
                 return;
             }
 
-            long entryId = doc["id"];
-            long workspaceId = doc["workspace_id"];
-            Serial.printf(">> Zatrzymuje timer ID: %ld\n", entryId);
+            StaticJsonDocument<2048> doc;
+            DeserializationError error = deserializeJson(doc, payload);
 
-            http.end(); // Zamykamy GET, otwieramy PATCH
-
-            // KROK 2: Zatrzymaj timer (PATCH)
-            String stopUrl = "https://api.track.toggl.com/api/v9/workspaces/" + String(workspaceId) + "/time_entries/" + String(entryId) + "/stop";
-            
-            if(http.begin(client, stopUrl)) {
-                http.setAuthorization(TOGGL_TOKEN, "api_token");
-                http.addHeader("Content-Type", "application/json"); // Wymagane
-                
-                // Toggl wymaga PATCH. Biblioteka HTTPClient obsługuje to przez sendRequest
-                int patchCode = http.sendRequest("PATCH", ""); 
-
-                if (patchCode == 200) {
-                    Serial.println(">> ZATRZYMANO!");
-                    M5.dis.drawpix(0, 0xFF0000); // CZERWONY (Stop)
-                    delay(2000);
-                    M5.dis.drawpix(0, 0x00FF00); // Zielony
-                } else {
-                    Serial.printf(">> Blad zatrzymywania: %d\n", patchCode);
-                    M5.dis.drawpix(0, 0xFF00FF); // Błąd
-                }
+            if (error) {
+                Serial.print(">> Blad JSON: "); Serial.println(error.c_str());
+                httpGet.end();
+                return;
             }
+
+            // ZMIANA: Pobieramy jako String (.as<String>())
+            entryId = doc["id"].as<String>();
+            workspaceId = doc["workspace_id"].as<String>();
+
+            // Sprawdzamy czy String nie jest pusty lub "null"
+            if (entryId == "null" || entryId.length() == 0) {
+                Serial.println(">> BLAD: Puste ID!");
+                httpGet.end();
+                return;
+            }
+
+            Serial.println(">> Znaleziono Timer ID: " + entryId);
+
+        } else {
+            Serial.printf(">> Blad GET: %d\n", httpCode);
+            httpGet.end();
+            return;
         }
-        http.end();
+        httpGet.end(); 
+    } else {
+        Serial.println(">> Blad polaczenia GET");
+        return;
+    }
+
+    // --- KROK 2: PATCH (Zatrzymanie) ---
+    HTTPClient httpPatch;
+    WiFiClientSecure clientPatch;
+    clientPatch.setInsecure();
+
+    // Tutaj Stringi same się ładnie skleją
+    String stopUrl = "https://api.track.toggl.com/api/v9/workspaces/" + workspaceId + "/time_entries/" + entryId + "/stop";
+    
+    Serial.println(">> [2/2] Wysylam STOP...");
+    
+    if(httpPatch.begin(clientPatch, stopUrl)) {
+        httpPatch.setAuthorization(TOGGL_TOKEN, "api_token");
+        httpPatch.addHeader("Content-Type", "application/json");
+        
+        int patchCode = httpPatch.sendRequest("PATCH", "{}"); 
+
+        if (patchCode == 200) {
+            Serial.println(">> SUKCES! ZATRZYMANO.");
+            M5.dis.drawpix(0, 0xFF0000); // CZERWONY = STOP
+            delay(2000);
+            M5.dis.drawpix(0, 0x00FF00); // Zielony
+        } else {
+            Serial.printf(">> Blad PATCH: %d\n", patchCode);
+            Serial.println(httpPatch.getString());
+            M5.dis.drawpix(0, 0xFF00FF); 
+        }
+        httpPatch.end();
     }
 }
 
