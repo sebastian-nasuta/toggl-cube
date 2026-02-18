@@ -91,12 +91,17 @@ void setup() {
     M5.begin(true, false, true);
     Serial.begin(115200);
     
-    // Inicjalizacja I2C dla Atom Lite (Grove Port)
-    // SDA = 26, SCL = 32
+    // 1. Najpierw inicjalizujemy magistralę I2C (piny Grove w Atom Lite: 26 i 32)
     Wire.begin(26, 32); 
-    rfid.begin(); // Init RFID
+    
+    // 2. Teraz inicjalizujemy czip RFID
+    rfid.PCD_Init(); 
 
-    // WiFi
+    // Opcjonalnie: Wypisz wersję firmware'u czytnika na Serial (dobry test czy działa)
+    Serial.print("RFID Reader Info: ");
+    rfid.PCD_DumpVersionToSerial();
+
+    // 3. WiFi
     Serial.print("Laczenie z WiFi: ");
     Serial.println(WIFI_SSID);
     M5.dis.drawpix(0, 0x000055); 
@@ -108,7 +113,7 @@ void setup() {
     }
     Serial.println("\nPolaczono!");
 
-    // Czas NTP
+    // 4. Czas NTP
     configTime(0, 0, "pool.ntp.org", "time.nist.gov"); 
     Serial.print("Synchronizacja czasu");
     struct tm timeinfo;
